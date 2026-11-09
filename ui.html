@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Mr Fin</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font:14px system-ui,sans-serif;max-width:860px;margin:20px auto;padding:0 12px;color:#222}
+fieldset{margin:0 0 14px;border:1px solid #ccc;border-radius:6px;padding:10px 14px}
+legend{font-weight:600}label{margin-right:12px;display:inline-block;margin-bottom:4px}
+input[type=number],input[type=text],input[type=time]{width:110px}
+.chips span{display:inline-block;background:#e6eefc;border-radius:12px;padding:2px 10px;margin:2px;cursor:pointer}
+.ratio button{margin-right:6px}.ratio button.on{background:#2563eb;color:#fff}
+#msg{color:#b00020;min-height:1.3em}#log{background:#111;color:#ddd;padding:8px;height:160px;overflow:auto;white-space:pre-wrap;font:12px monospace}
+.muted{color:#666;font-size:12px}button.go{background:#16a34a;color:#fff;border:0;padding:8px 18px;border-radius:4px}
+button.stop{background:#dc2626;color:#fff;border:0;padding:8px 18px;border-radius:4px}
+</style></head><body>
+<h2>Mr Fin <small id="state" class="muted"></small></h2>
+<p class="muted">Use a demo account first. Stop clears pending signals but does not close positions or disable the EA.</p>
+
+<fieldset><legend>1. Instruments (pick up to 3)</legend>
+<div id="groups"></div>
+<div>Broker/custom symbol: <input type="text" id="custom" list="brokerList" placeholder="e.g. EURUSD.m">
+<button id="addCustom" type="button">Add</button> <button id="loadBroker" type="button">Load broker symbols</button> <span id="brokerNote" class="muted"></span></div>
+<datalist id="brokerList"></datalist>
+<div>Selected: <span id="selSymbols" class="chips"></span> <span class="muted">(click to remove)</span></div>
+</fieldset>
+
+<fieldset><legend>2. Timeframes (pick up to 3)</legend><div id="tfs"></div></fieldset>
+
+<fieldset><legend>3. Pip size</legend>
+<label><input type="number" id="pip" step="any" min="0" placeholder="auto"> price units per pip (blank = per-instrument default)</label>
+<div class="muted" id="pipHint"></div></fieldset>
+
+<fieldset><legend>4. Take profit / stop loss</legend>
+<label><input type="checkbox" id="slOn"> SL on</label><label><input type="checkbox" id="tpOn"> TP on</label>
+<div>Mode:
+<label><input type="radio" name="mode" value="auto"> Strategy (automatic)</label>
+<label><input type="radio" name="mode" value="pips"> Fixed pips</label>
+<label><input type="radio" name="mode" value="ratio"> Ratio (TP = SL x ratio)</label></div>
+<div id="pipsBox">SL pips <input type="number" id="slPips" min="0" step="any"> TP pips <input type="number" id="tpPips" min="0" step="any"></div>
+<div id="ratioBox" class="ratio">Ratio: <span id="ratioBtns"></span> custom 1:<input type="number" id="ratio" min="0" step="any">
+ <span class="muted">SL pips (optional, otherwise strategy SL)</span> <input type="number" id="slPipsR" min="0" step="any"></div>
+</fieldset>
+
+<fieldset><legend>5. Schedule</legend>
+<label>Days <select id="days"></select></label>
+<label><input type="checkbox" id="hrsOn"> Only look for trades between</label>
+<input type="time" id="hStart"> and <input type="time" id="hEnd">
+<label>at UTC offset <input type="number" id="utc" step="0.5" min="-14" max="14"></label>
+<div class="muted">Days count from when you press Start.</div></fieldset>
+
+<fieldset><legend>6. Amount limits</legend>
+<label>Initial amount <input type="number" id="initial" min="0" step="any"></label>
+<label>Amount to trade (ATT) <input type="number" id="att" min="0" step="any"></label>
+<label>Amount to lose (ATL) <input type="number" id="atl" min="0" step="any"></label>
+<label>Amount to profit (ATP) <input type="number" id="atp" min="0" step="any"></label>
+<div><label><input type="checkbox" id="formula"> Use formula</label></div>
+<div class="muted">ATT is adjusted by the session profit/loss. With the formula on, trading stops and the EA's positions are closed when ATT &le; ATL or ATT &ge; ATP. Off = trades run unrestricted. Checked once per refresh and needs <code>--source mt5</code>.</div></fieldset>
+
+<p><button class="go" id="start">Start</button> <button class="stop" id="stop">Stop</button></p>
+<div id="msg"></div><div id="log"></div>
+
+<script>
+const $=id=>document.getElementById(id);let cfg,sel=[],tfs=[],ratio=2;
+const api=(p,b)=>fetch(p,b===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json().then(j=>{if(!r.ok)throw new Error(j.error);return j}));
+const el=(t,props={},kids=[])=>Object.assign(document.createElement(t),props);
+function renderSel(){const s=$('selSymbols');s.replaceChildren(...sel.map(n=>el('span',{textContent:n,onclick:()=>{sel=sel.filter(x=>x!==n);renderSel()}})));
+ const p=sel.filter(n=>n in cfg.pips).map(n=>n+' '+cfg.pips[n]).join(', ');$('pipHint').textContent=p?'Defaults: '+p:''}
+function addSym(n){n=n.trim();if(!n||sel.includes(n))return;if(sel.length>=cfg.max_selection){msg('Maximum '+cfg.max_selection+' instruments');return}sel.push(n);renderSel()}
+function msg(t){$('msg').textContent=t||''}
+function setMode(m){document.querySelector(`input[name=mode][value=${m}]`).checked=true;
+ $('pipsBox').style.display=m==='pips'?'':'none';$('ratioBox').style.display=m==='ratio'?'':'none'}
+function setRatio(v){ratio=v;$('ratio').value=v;document.querySelectorAll('#ratioBtns button').forEach(b=>b.classList.toggle('on',cfg.ratios[b.textContent]===v))}
+const num=id=>$(id).value===''?null:Number($(id).value);
+function collect(){const m=document.querySelector('input[name=mode]:checked').value;
+ return{symbols:sel,timeframes:tfs,pip_size:num('pip'),sl_enabled:$('slOn').checked,tp_enabled:$('tpOn').checked,tpsl_mode:m,
+ sl_pips:m==='ratio'?num('slPipsR'):num('slPips'),tp_pips:num('tpPips'),ratio:num('ratio')??ratio,days:Number($('days').value),
+ hours_enabled:$('hrsOn').checked,hours_start:$('hStart').value,hours_end:$('hEnd').value,utc_offset:num('utc')??0,
+ initial_amount:num('initial'),att:num('att'),atl:num('atl'),atp:num('atp'),formula_enabled:$('formula').checked}}
+async function init(){cfg=await api('/api/config');const p=cfg.plan;
+ $('groups').replaceChildren(...Object.entries(cfg.groups).map(([g,ns])=>el('div',{},[el('b',{textContent:g+': '}),...ns.map(n=>el('label',{},[el('input',{type:'checkbox',value:n,onchange:e=>{if(e.target.checked)addSym(n);else sel=sel.filter(x=>x!==n);renderSel();syncBoxes()}}),document.createTextNode(' '+n)]))])));
+ $('tfs').replaceChildren(...cfg.timeframes.map(t=>el('label',{},[el('input',{type:'checkbox',value:t,checked:p.timeframes.includes(t),onchange:e=>{if(e.target.checked){if(tfs.length>=cfg.max_selection){e.target.checked=false;msg('Maximum '+cfg.max_selection+' timeframes');return}tfs.push(t)}else tfs=tfs.filter(x=>x!==t)}}),document.createTextNode(' '+t)])));
+ tfs=[...p.timeframes];sel=[...p.symbols];
+ $('ratioBtns').replaceChildren(...Object.entries(cfg.ratios).map(([k,v])=>el('button',{type:'button',textContent:k,onclick:()=>setRatio(v)})));
+ $('days').replaceChildren(...Array.from({length:cfg.max_days},(_,i)=>el('option',{value:i+1,textContent:i+1})));
+ $('pip').value=p.pip_size??'';$('slOn').checked=p.sl_enabled;$('tpOn').checked=p.tp_enabled;setMode(p.tpsl_mode);
+ $('slPips').value=p.tpsl_mode==='ratio'?'':p.sl_pips??'';$('slPipsR').value=p.tpsl_mode==='ratio'?p.sl_pips??'':'';$('tpPips').value=p.tp_pips??'';setRatio(p.ratio);
+ $('days').value=p.days;$('hrsOn').checked=p.hours_enabled;$('hStart').value=p.hours_start;$('hEnd').value=p.hours_end;$('utc').value=p.utc_offset;
+ for(const k of['initial_amount:initial','att:att','atl:atl','atp:atp'])$(k.split(':')[1]).value=p[k.split(':')[0]]??'';
+ $('formula').checked=p.formula_enabled;renderSel();syncBoxes()}
+function syncBoxes(){document.querySelectorAll('#groups input').forEach(i=>i.checked=sel.includes(i.value))}
+document.querySelectorAll('input[name=mode]').forEach(r=>r.onchange=()=>setMode(r.value));
+$('ratio').oninput=()=>setRatio(Number($('ratio').value));
+$('addCustom').onclick=()=>{addSym($('custom').value);$('custom').value='';syncBoxes()};
+$('loadBroker').onclick=async()=>{const r=await api('/api/broker-symbols');$('brokerNote').textContent=r.error||r.symbols.length+' symbols loaded';
+ $('brokerList').replaceChildren(...r.symbols.map(s=>el('option',{value:s})))};
+$('start').onclick=async()=>{msg();try{await api('/api/start',collect());poll()}catch(e){msg(e.message)}};
+$('stop').onclick=async()=>{msg();try{await api('/api/stop',{});poll()}catch(e){msg(e.message)}};
+async function poll(){try{const s=await api('/api/status');$('state').textContent=s.running?'(running)':'(stopped)';
+ const l=$('log');l.textContent=s.log.join('\n');l.scrollTop=l.scrollHeight}catch(e){}}
+init().then(()=>{poll();setInterval(poll,3000)});
+</script></body></html>

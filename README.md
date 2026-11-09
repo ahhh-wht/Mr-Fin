@@ -1,5 +1,7 @@
 # Mr Fin signal exporter
 
+## Console
+
 Start the interactive console in a terminal:
 
 ```powershell
@@ -41,3 +43,22 @@ To prevent further trading, also disable AutoTrading/Algo Trading or remove the
 EA. Existing exporters started before the locking feature was added must be
 stopped separately before using the console; otherwise they can overwrite the
 same signal file.
+
+## Settings page
+
+```powershell
+.\run_btmm.bat --ui --source mt5
+```
+
+Opens `http://localhost:8765/` (local only). On the page you can:
+
+1. Pick up to 3 instruments (built-in list, or any broker symbol; "Load broker symbols" lists them from a running MT5).
+2. Pick up to 3 timeframes.
+3. Override the pip size (blank = per-instrument default).
+4. Turn SL and TP on/off independently or together, and set them by strategy, fixed pips, or a ratio (1:1, 1:2, 1:3 or custom; TP = SL x ratio).
+5. Set a schedule: 1-3 days from pressing Start, and optional trading hours (with a UTC offset) in which signals are exported.
+6. Set amount limits: initial amount, ATT (amount to trade), ATL (amount to lose), ATP (amount to profit), plus a formula switch.
+
+Formula: the running amount is `ATT + session profit/loss`. When it is at or below ATL, or at or above ATP, the exporter stops, clears pending signals and closes the EA's open positions. With the formula off, nothing is stopped by amount. The check runs once per refresh (default 5 minutes) and needs `--source mt5` to read profit/loss; with other sources it is not enforced. Closing positions uses the EA's magic number (`26110601`), so keep it unchanged in the EA. Settings are saved in `btmm_plan.json`.
+
+The EAs treat an SL or TP of 0 in the signal file as "off"; re-compile them after updating.

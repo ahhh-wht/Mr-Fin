@@ -96,7 +96,9 @@ void Execute(string &p[])
 
    bool isLong = (dir == "long");
    double ask = MarketInfo(sym, MODE_ASK), bid = MarketInfo(sym, MODE_BID);
-   if(isLong ? !(sl < bid && tp > ask) : !(sl > ask && tp < bid))
+   bool slOk = (sl == 0) || (isLong ? sl < bid : sl > ask);   // 0 = SL off
+   bool tpOk = (tp == 0) || (isLong ? tp > ask : tp < bid);   // 0 = TP off
+   if(!(slOk && tpOk))
 	 {
 	  Print("BTMM: ", id, " skipped, price already beyond SL/TP");
 	  return;

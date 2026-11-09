@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import itertools
 import json
 import math
@@ -16,6 +17,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
+
+from plan import TradePlan
 
 import numpy as np
 import pandas as pd
@@ -196,6 +199,52 @@ def fetch_mt5(symbol: str, cfg: BTMMConfig, bars: int, offset_hours: float, term
     return df[["datetime", "open", "high", "low", "close", "volume"]].dropna().sort_values("datetime").reset_index(drop=True), pip
 
 
+EA_MAGIC = 26110601  # must match InpMagic in the MT4/MT5 bridge EA
+
+
+def mt5_session_pnl(started_at: float, offset_hours: float, magic: int = EA_MAGIC, terminal_path: Optional[str] = None) -> float:
+    """Realised + floating P&L of the EA's trades since started_at (epoch seconds)."""
+    import MetaTrader5 as mt5
+    if not (mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()):
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+    try:
+        since = pd.Timestamp(started_at - 86400, unit="s").to_pydatetime()
+        until = pd.Timestamp(time.time() + 2 * 86400, unit="s").to_pydatetime()
+        total = 0.0
+        for deal in mt5.history_deals_get(since, until) or []:
+            if deal.magic == magic and deal.time - offset_hours * 3600 >= started_at:
+                total += deal.profit + deal.commission + deal.swap + getattr(deal, "fee", 0.0)
+        total += sum(p.profit + p.swap for p in mt5.positions_get() or [] if p.magic == magic)
+        return total
+    finally:
+        mt5.shutdown()
+
+
+def mt5_close_positions(magic: int = EA_MAGIC, terminal_path: Optional[str] = None) -> int:
+    """Closes every open position opened by the EA; returns how many were closed."""
+    import MetaTrader5 as mt5
+    if not (mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()):
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+    closed = 0
+    try:
+        for pos in mt5.positions_get() or []:
+            if pos.magic != magic:
+                continue
+            tick = mt5.symbol_info_tick(pos.symbol)
+            is_buy = pos.type == mt5.POSITION_TYPE_BUY
+            result = mt5.order_send({"action": mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
+                                     "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY, "position": pos.ticket,
+                                     "price": tick.bid if is_buy else tick.ask, "deviation": 20, "magic": magic,
+                                     "comment": "BTMM limit reached"})
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                closed += 1
+            else:
+                print(f"  ! could not close {pos.symbol} #{pos.ticket}: {getattr(result, 'retcode', mt5.last_error())}", flush=True)
+        return closed
+    finally:
+        mt5.shutdown()
+
+
 def fetch_csv(path: str, offset_hours: float) -> pd.DataFrame:
     """Reads MT4 History Center exports (no header) and MT5 exports (<DATE> <TIME> ... header)."""
     with open(path, "r", encoding="utf-8-sig", errors="ignore") as handle:
@@ -340,13 +389,15 @@ def signal_export_lock(path: Path):
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def build_signal_rows(signals, cfg: BTMMConfig, symbol: str, pip: float, last_bar, window: int) -> list:
+def build_signal_rows(signals, cfg: BTMMConfig, symbol: str, pip: float, last_bar, window: int, plan: Optional[TradePlan] = None) -> list:
     """Fresh signals for the BTMM_Bridge EA (MT4/MT5)."""
     rows = []
     for sig in signals:
         if sig.signal_time < last_bar - pd.Timedelta(minutes=cfg.tf_minutes * (window - 1)):
             continue
         sl, tp, _ = compute_sl_tp(cfg, sig.direction, sig.price, sig.pattern_data["pattern_stop"], sig.pattern_data["atr"], pip)
+        if plan:
+            sl, tp = plan.apply_levels(sl, tp)
         expires = sig.signal_time + pd.Timedelta(minutes=cfg.tf_minutes * (window + 1))
         rows.append({"id": f"{symbol}-{cfg.timeframe}-{int(sig.signal_time.timestamp())}", "symbol": symbol, "direction": sig.direction.value, "entry": round(sig.price, 5), "sl": round(sl, 5), "tp": round(tp, 5), "lots": cfg.lot_size, "expires_utc": int(expires.timestamp()), "comment": sig.signal_type.replace(",", " ")})
     return rows
@@ -627,12 +678,47 @@ def build_cfg(args):
     return BTMMConfig(timeframe=parse_timeframes(args.timeframe)[0], sl_mode=args.sl_mode, tp_mode=args.tp_mode, fixed_sl_pips=args.sl, fixed_tp_pips=args.tp, sl_buffer_pips=args.sl_buffer, rr_ratio=args.rr, atr_mult_sl=args.atr_mult, breakeven_at_pips=None if args.no_be else args.be, trailing_stop_pips=args.trail, lot_size=args.lot, initial_balance=args.balance, run_label=f"{args.label}-{args.timeframe}-{args.sl_mode}{args.sl}-{args.tp_mode}{args.tp}")
 
 
+def plan_stop_reason(args, plan: TradePlan, started_at: float) -> Optional[str]:
+    """Why the session must end now, or None. Limits are checked once per refresh."""
+    if plan.expired(started_at):
+        return f"the {plan.days}-day schedule has ended"
+    if not plan.formula_enabled:
+        return None
+    if args.source != "mt5":
+        print("  ! ATL/ATP formula needs --source mt5 to read profit/loss; it is not being enforced", flush=True)
+        return None
+    try:
+        pnl = mt5_session_pnl(started_at, args.broker_utc_offset, terminal_path=args.mt5_path)
+    except Exception as exc:
+        print(f"  ! could not read P&L: {exc}", flush=True)
+        return None
+    print(f"  session P&L {pnl:+.2f}; amount to trade now {plan.running_amount(pnl):.2f}", flush=True)
+    return plan.risk_stop_reason(pnl)
+
+
 def run_watch(args, stop_event=None):
+    plan = getattr(args, "plan", None)
+    started_at = time.time()
     with signal_export_lock(signals_path(args.export_signals)) if args.export_signals else nullcontext():
         try:
             while True:
                 try:
-                    run(args)
+                    reason = plan_stop_reason(args, plan, started_at) if plan else None
+                    if reason:
+                        print(f"Stopping: {reason}.", flush=True)
+                        if args.export_signals:
+                            write_signals([], signals_path(args.export_signals))
+                        if plan.formula_enabled and args.source == "mt5":
+                            print(f"Closed {mt5_close_positions(terminal_path=args.mt5_path)} open position(s).", flush=True)
+                        if stop_event:
+                            stop_event.set()
+                        break
+                    if plan and not plan.in_trading_hours():
+                        print("  outside trading hours; no signals exported", flush=True)
+                        if args.export_signals:
+                            write_signals([], signals_path(args.export_signals))
+                    else:
+                        run(args)
                 except Exception as exc:
                     if not args.watch:
                         raise
@@ -751,6 +837,8 @@ def main():
     parser.add_argument("--mt-suffix", default="", help="broker symbol suffix applied to --symbols, e.g. .m")
     parser.add_argument("--mt-map", help="broker name overrides, e.g. US30=DJ30.cash,XAUUSD=GOLD")
     parser.add_argument("--control", action="store_true", help="interactive start/stop console for up to three symbols")
+    parser.add_argument("--ui", action="store_true", help="open the browser page to choose pairs, timeframes, TP/SL, schedule and limits")
+    parser.add_argument("--port", type=int, default=8765, help="port for --ui (served on 127.0.0.1 only)")
     args = parser.parse_args()
     if args.list_symbols:
         print_instruments()
@@ -759,7 +847,12 @@ def main():
         parser.error("--grid cannot be combined with --export-signals or --watch")
     if args.watch is not None and (not math.isfinite(args.watch) or args.watch <= 0):
         parser.error("--watch must be a positive number of minutes")
-    if args.control:
+    if args.ui:
+        if args.grid or args.symbols or args.csv or args.control or args.source == "csv":
+            parser.error("--ui cannot be combined with --grid, --symbols, --csv or --control; choose them on the page")
+        import ui
+        ui.serve(args)
+    elif args.control:
         if args.grid or args.symbols or args.csv:
             parser.error("--control does not support --grid, --symbols, or --csv; select symbols with start")
         if args.source == "csv":
@@ -774,12 +867,15 @@ def run(args):
     database = BTMMDatabase(args.db)
     combos = [(tf, sl, tp) for tf in ("15m", "60m", "4h") for sl in (15, 20, 30) for tp in (30, 50, 80)] if args.grid else [(tf, args.sl, args.tp) for tf in parse_timeframes(args.timeframe)]
     results = []
+    plan = getattr(args, "plan", None)
     instruments = resolve_instruments(args)
     signal_rows, loaded = [], False
     try:
         for inst, (timeframe, sl_value, tp_value) in itertools.product(instruments, combos):
             label = inst["label"]
             cfg = BTMMConfig(timeframe=timeframe, sl_mode="fixed" if args.grid else args.sl_mode, tp_mode="fixed" if args.grid else args.tp_mode, fixed_sl_pips=sl_value, fixed_tp_pips=tp_value, sl_buffer_pips=args.sl_buffer, rr_ratio=args.rr, atr_mult_sl=args.atr_mult, breakeven_at_pips=None if args.grid or args.no_be else args.be, trailing_stop_pips=None if args.grid else args.trail, lot_size=args.lot, initial_balance=args.balance, run_label=f"{label}-{timeframe}-SL{sl_value}-TP{tp_value}" if args.grid else f"{label}-{timeframe}-{args.sl_mode}{sl_value}-{args.tp_mode}{tp_value}")
+            if plan:
+                cfg = dataclasses.replace(cfg, **plan.cfg_overrides())
             print(f"\n=== {label} @ {timeframe} ===")
             print(f"  SL mode={cfg.sl_mode} TP mode={cfg.tp_mode} scratch={cfg.effective_scratch_hours:.1f}h gap window={cfg.effective_gap_min:.0f}-{cfg.effective_gap_max:.0f}min")
             try:
@@ -789,13 +885,14 @@ def run(args):
                     raise
                 print(f"  ! {label} skipped: {exc}")
                 continue
+            pip = plan.pip_size if plan and plan.pip_size else pip
             df = detect_swings(add_indicators(df), cfg.swing_window)
             database.save_price(label, timeframe, df)
             backtester = Backtester(label, cfg, pip)
             strategy = BTMMStrategy(label, cfg, pip)
             backtester.run(df, strategy)
             if args.export_signals:
-                fresh = build_signal_rows(strategy.generate_signals(df), cfg, symbol, pip, df["datetime"].iloc[-1], args.export_window)
+                fresh = build_signal_rows(strategy.generate_signals(df), cfg, symbol, pip, df["datetime"].iloc[-1], args.export_window, plan)
                 signal_rows += fresh
                 loaded = True
                 print(f"  -> {len(fresh)} fresh signal(s) for {symbol}")
