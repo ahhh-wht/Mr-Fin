@@ -1,0 +1,9 @@
+.vs/
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+btmm_grid_results.csv
